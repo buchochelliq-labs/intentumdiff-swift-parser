@@ -2,7 +2,7 @@
 //!
 //! This compact parser avoids a host tree-sitter dependency. It lexes the whole
 //! source into tokens (dropping whitespace and `//` / nested `/* */` comments,
-//! keeping string literals intact) and groups the tokens into declarations and
+//! keeping string literals and extended `#/.../#` regex literals intact) and groups the tokens into declarations and
 //! statements by braces, semicolons and Swift's newline statement boundaries.
 //! Every non-trivia token of the source ends up in exactly one node label, so a
 //! changed token is never silently dropped and comments/layout never surface.
@@ -138,6 +138,36 @@ fn scan_string(bytes: &[u8], p: usize, hashes: usize, depth: usize) -> usize {
     n
 }
 
+/// Scan an extended regex literal `#/.../#` (any number of `#`) whose opening
+/// `/` is at `p`, with `hashes` delimiters already consumed before it. Returns
+/// the end offset. Swift only allows `/` straight after `#` to open a regex
+/// literal, so this is unambiguous. When only whitespace follows the opening
+/// delimiter on its row, the literal is multi-line and may span rows; otherwise
+/// a newline ends an unterminated literal. A backslash escapes the next byte.
+/// The whole literal is one token, so `//` and `/* */` inside it are payload.
+fn scan_regex(bytes: &[u8], p: usize, hashes: usize) -> usize {
+    let n = bytes.len();
+    let mut q = p + 1;
+    let rest_blank = bytes[q..]
+        .iter()
+        .take_while(|&&b| b != b'\n')
+        .all(|&b| b == b' ' || b == b'\t' || b == b'\r');
+    let multiline = q < n && rest_blank && bytes[q..].contains(&b'\n');
+    while q < n {
+        match bytes[q] {
+            b'\\' if multiline || bytes.get(q + 1) != Some(&b'\n') => q += 2,
+            b'\n' if !multiline => return q,
+            b'/' if bytes.len() >= q + 1 + hashes
+                && bytes[q + 1..q + 1 + hashes].iter().all(|&b| b == b'#') =>
+            {
+                return q + 1 + hashes;
+            }
+            _ => q += 1,
+        }
+    }
+    n
+}
+
 fn scan_interpolation(bytes: &[u8], mut q: usize, depth: usize) -> usize {
     let n = bytes.len();
     let mut parens = 1usize;
@@ -158,6 +188,10 @@ fn scan_interpolation(bytes: &[u8], mut q: usize, depth: usize) -> usize {
                 let h = bytes[q..].iter().take_while(|&&b| b == b'#').count();
                 if q + h < n && bytes[q + h] == b'"' {
                     q = scan_string(bytes, q + h, h, depth);
+                    continue;
+                }
+                if q + h < n && bytes[q + h] == b'/' {
+                    q = scan_regex(bytes, q + h, h);
                     continue;
                 }
             }
@@ -210,6 +244,8 @@ fn lex(source: &str) -> Vec<Token> {
             let h = bytes[p..].iter().take_while(|&&c| c == b'#').count();
             if p + h < n && bytes[p + h] == b'"' {
                 scan_string(bytes, p + h, h, 0)
+            } else if p + h < n && bytes[p + h] == b'/' {
+                scan_regex(bytes, p + h, h)
             } else if h == 1 && p + 1 < n && is_ident_start(bytes[p + 1]) {
                 let mut q = p + 1;
                 while q < n && is_ident_continue(bytes[q]) {
@@ -1083,6 +1119,70 @@ mod tests {
         );
     }
 
+    // PR #6 review: `//` inside an extended regex literal was lexed as a line
+    // comment, truncating `#/https://one.example/#` to `# / https :`.
+    #[test]
+    fn extended_regex_literal_is_not_a_comment() {
+        let old = "let regex = #/https://one.example/#\n";
+        let new = "let regex = #/https://two.example/#\n";
+        assert_ne!(root_hash(old), root_hash(new));
+        assert_eq!(
+            find(
+                old,
+                "variable_declaration",
+                "let regex = #/https://one.example/#"
+            ),
+            [0, 0, 0, 35]
+        );
+        let pairs = [
+            ("let r = #/https?://x/#\n", "let r = #/https?://y/#\n"),
+            ("let r = #/a/*b*/c/#\n", "let r = #/a/*d*/c/#\n"),
+            ("let r = ##/a/#//b/##\n", "let r = ##/a/#//c/##\n"),
+            ("let r = #/a\\/#//b/#\n", "let r = #/a\\/#//c/#\n"),
+            ("let r = #/\"//a/#\n", "let r = #/\"//b/#\n"),
+            (
+                "let r = #/\n  https:// one # comment\n/#\n",
+                "let r = #/\n  https:// two # comment\n/#\n",
+            ),
+            ("func f() { m(#/}//a/#) }\n", "func f() { m(#/}//b/#) }\n"),
+            (
+                "let s = \"\\(x.matches(#/)//a/#))\"\n",
+                "let s = \"\\(x.matches(#/)//b/#))\"\n",
+            ),
+        ];
+        for (old, new) in pairs {
+            assert_ne!(root_hash(old), root_hash(new), "{old:?} -> {new:?}");
+        }
+        // A `}` inside the regex is payload, not a block close.
+        assert_eq!(
+            payload("func f() { m(#/}//a/#) }\n")[3],
+            ("function_call_expression".into(), "m(#/}//a/#)".into())
+        );
+    }
+
+    #[test]
+    fn comments_around_regex_literals_are_still_trivia() {
+        let base = "let r = #/https?://x/#\nlet y = 1\n";
+        let variants = [
+            "let r = #/https?://x/# // trailing\nlet y = 1\n",
+            "// lead\nlet r = #/https?://x/#\n/* block */ let y = 1\n",
+            "let r = #/https?://x/#\n\n   let y = 1 // https://z/#\n",
+        ];
+        for v in variants {
+            assert_eq!(payload(base), payload(v), "{v:?}");
+            assert_eq!(root_hash(base), root_hash(v), "{v:?}");
+        }
+        // Comment markers inside multi-line and raw strings stay payload.
+        assert_ne!(
+            root_hash("let s = \"\"\"\n// a\n\"\"\"\n"),
+            root_hash("let s = \"\"\"\n// b\n\"\"\"\n")
+        );
+        assert_ne!(
+            root_hash("let s = #\"// a\"#\n"),
+            root_hash("let s = #\"// b\"#\n")
+        );
+    }
+
     #[test]
     fn identity_and_determinism() {
         let example = <SwiftParser as Guest>::example("swift".to_string());
@@ -1101,11 +1201,23 @@ mod tests {
             "let s = \"\"\"\nopen",
             "/* open",
             "let s = \"\\(",
+            "let r = #/open",
+            "let r = ##/a/#\n",
+            "let r = #/\nopen",
+            "let r = #/a\\",
+            "#",
+            "#/",
             deep.as_str(),
         ];
         for src in inputs {
             tree(src);
         }
+        // An unterminated single-line regex stops at the newline.
+        find(
+            "let r = #/open\nlet y = 1\n",
+            "variable_declaration",
+            "let y = 1",
+        );
         // Unbalanced input keeps its tokens; deep nesting is flattened, not lost.
         find("}}}\n", "expression_statement", "}");
         let deep_changed = format!("{}x", "{".repeat(40));
